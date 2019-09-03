@@ -1,0 +1,109 @@
+#!/usr/bin/python3
+#
+# Copyright (C) 2019 Nicolas Schodet
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+# IN THE SOFTWARE.
+#
+import os
+import argparse
+import configparser
+import tmdbsimple as tmdb
+
+CONFIG = '~/.tmdblookup.conf'
+
+class App:
+    """Quick lookup on TheMovieDB."""
+
+    def run(self, args):
+        defaults = {}
+        # Parse configuration.
+        config = configparser.ConfigParser()
+        config.read([os.path.expanduser(CONFIG)])
+        defaults.update(dict(config.items('DEFAULT')))
+        # Parse options.
+        p = argparse.ArgumentParser(description=self.__doc__)
+        p.set_defaults(**defaults)
+        p.add_argument('--api-key',
+                help='API key created in your account')
+        p.add_argument('-l', '--language',
+                help='content language')
+        p.add_argument('-t', '--tv', action='store_true',
+                help='search TV show')
+        p.add_argument('-i', '--show-id', action='store_true',
+                help='show identifier')
+        p.add_argument('-s', '--season', type=int,
+                help='print the list of episodes for a TV show season')
+        p.add_argument('query', nargs='+', help='query terms or identifier')
+        options = p.parse_args()
+        if options.api_key is None:
+            p.error('need an API key')
+        tmdb.API_KEY = options.api_key
+        query = ' '.join(options.query)
+        if options.season is not None:
+            self.show_season(query, options)
+        else:
+            self.search(query, options)
+
+    def search(self, query, options):
+        """Perform a TV show or movie search and print result."""
+        search = tmdb.Search()
+        searchf = search.tv if options.tv else search.movie
+        searchd = dict(query=query)
+        if options.language:
+            searchd['language'] = options.language
+        searchf(**searchd)
+        for r in search.results:
+            y = None
+            if options.tv:
+                name = r['name']
+                try:
+                    y = r['first_air_date']
+                except KeyError:
+                    pass
+            else:
+                name = r['title']
+                try:
+                    y = r['release_date']
+                except KeyError:
+                    pass
+            l = []
+            if options.show_id:
+                l.append(str(r['id']))
+            l.append(name)
+            if y:
+                y, _, _ = y.split('-')
+                l.append('(%s)' % y)
+            print(' '.join(l))
+
+    def show_season(self, query, options):
+        """Print the list of episodes for a TV show season."""
+        tv_id = int(query)
+        season = tmdb.TV_Seasons(tv_id, options.season)
+        infod = dict()
+        if options.language:
+            infod['language'] = options.language
+        season.info(**infod)
+        for e in season.episodes:
+            print('%dx%02d %s' % (season.season_number, e['episode_number'],
+                e['name']))
+
+if __name__ == '__main__':
+    import sys
+    a = App()
+    a.run(sys.argv[1:])
