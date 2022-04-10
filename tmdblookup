@@ -20,9 +20,12 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 # IN THE SOFTWARE.
 #
-import os
 import argparse
 import configparser
+import os
+import subprocess
+import sys
+
 import tmdbsimple as tmdb
 
 CONFIG = '~/.tmdblookup.conf'
@@ -49,25 +52,38 @@ class App:
                 help='show identifier')
         p.add_argument('-s', '--season', type=int,
                 help='print the list of episodes for a TV show season')
+        p.add_argument('-a', '--all-seasons', action='store_true',
+                help='print the list of all episodes for a TV show')
         p.add_argument('query', nargs='+', help='query terms or identifier')
         options = p.parse_args()
         if options.api_key is None:
             p.error('need an API key')
         tmdb.API_KEY = options.api_key
         query = ' '.join(options.query)
-        if options.season is not None:
-            self.show_season(query, options)
+        if options.season is not None or options.all_seasons:
+            try:
+                i = int(query)
+            except ValueError:
+                i, l = self.get_id(query, options)
+                print(l)
+            self.show_season(i, options)
         else:
-            self.search(query, options)
+            results = self.search(query, options)
+            for i, l in results.items():
+                if options.show_id:
+                    print(i, l)
+                else:
+                    print(l)
 
     def search(self, query, options):
-        """Perform a TV show or movie search and print result."""
+        """Perform a TV show or movie search."""
         search = tmdb.Search()
         searchf = search.tv if options.tv else search.movie
         searchd = dict(query=query)
         if options.language:
             searchd['language'] = options.language
         searchf(**searchd)
+        results = {}
         for r in search.results:
             y = None
             if options.tv:
@@ -83,27 +99,63 @@ class App:
                 except KeyError:
                     pass
             l = []
-            if options.show_id:
-                l.append(str(r['id']))
             l.append(name)
             if y:
                 y, _, _ = y.split('-')
                 l.append('(%s)' % y)
-            print(' '.join(l))
+            results[r['id']] = ' '.join(l)
+        return results
 
-    def show_season(self, query, options):
+    def select(self, results):
+        """Select one of the results."""
+        r = subprocess.run(['fzf', '--height=12', '--with-nth=2', '--delimiter=\t'],
+                           input='\n'.join(f'{i}\t{l}' for i, l in results.items()),
+                           stdout=subprocess.PIPE, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("no selection done")
+        else:
+            return int(r.stdout.split(maxsplit=1)[0])
+
+    def get_id(self, query, options):
+        """Return a TV or movie identifier and name, ask the user if needed."""
+        results = self.search(query, options)
+        if len(results) == 0:
+            raise RuntimeError("no result")
+        elif len(results) == 1:
+            for i, l in results.items():
+                return i, l
+        else:
+            i = self.select(results)
+            return i, results[i]
+
+    def get_seasons(self, tv_id, options):
+        """Get the list of seasons for a TV show."""
+        if options.season is not None:
+            return [options.season]
+        else:
+            tv = tmdb.TV(tv_id)
+            infod = dict()
+            if options.language:
+                infod['language'] = options.language
+            tv.info(**infod)
+            return [s['season_number'] for s in tv.seasons]
+
+    def show_season(self, tv_id, options):
         """Print the list of episodes for a TV show season."""
-        tv_id = int(query)
-        season = tmdb.TV_Seasons(tv_id, options.season)
-        infod = dict()
-        if options.language:
-            infod['language'] = options.language
-        season.info(**infod)
-        for e in season.episodes:
-            print('%dx%02d %s' % (season.season_number, e['episode_number'],
-                e['name']))
+        for s in self.get_seasons(tv_id, options):
+            season = tmdb.TV_Seasons(tv_id, s)
+            infod = dict()
+            if options.language:
+                infod['language'] = options.language
+            season.info(**infod)
+            for e in season.episodes:
+                print('%dx%02d %s' % (season.season_number, e['episode_number'],
+                    e['name']))
 
 if __name__ == '__main__':
     import sys
     a = App()
-    a.run(sys.argv[1:])
+    try:
+        a.run(sys.argv[1:])
+    except RuntimeError as e:
+        sys.exit(str(e))
