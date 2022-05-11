@@ -1,5 +1,7 @@
 #!/usr/bin/python3
 #
+"""Tool to query TheMovieDB and rename files."""
+#
 # Copyright (C) 2019 Nicolas Schodet
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -23,139 +25,392 @@
 import argparse
 import configparser
 import os
+import re
 import subprocess
-import sys
 
+import requests
 import tmdbsimple as tmdb
 
-CONFIG = '~/.tmdblookup.conf'
+CONFIG = "~/.tmdblookup.conf"
 
-class App:
-    """Quick lookup on TheMovieDB."""
 
-    def run(self, args):
-        defaults = {}
-        # Parse configuration.
-        config = configparser.ConfigParser()
-        config.read([os.path.expanduser(CONFIG)])
-        defaults.update(dict(config.items('DEFAULT')))
-        # Parse options.
-        p = argparse.ArgumentParser(description=self.__doc__)
-        p.set_defaults(**defaults)
-        p.add_argument('--api-key',
-                help='API key created in your account')
-        p.add_argument('-l', '--language',
-                help='content language')
-        p.add_argument('-t', '--tv', action='store_true',
-                help='search TV show')
-        p.add_argument('-i', '--show-id', action='store_true',
-                help='show identifier')
-        p.add_argument('-s', '--season', type=int,
-                help='print the list of episodes for a TV show season')
-        p.add_argument('-a', '--all-seasons', action='store_true',
-                help='print the list of all episodes for a TV show')
-        p.add_argument('query', nargs='+', help='query terms or identifier')
-        options = p.parse_args()
-        if options.api_key is None:
-            p.error('need an API key')
-        tmdb.API_KEY = options.api_key
-        query = ' '.join(options.query)
-        if options.season is not None or options.all_seasons:
-            try:
-                i = int(query)
-            except ValueError:
-                i, l = self.get_id(query, options)
-                print(l)
-            self.show_season(i, options)
-        else:
-            results = self.search(query, options)
-            for i, l in results.items():
-                if options.show_id:
-                    print(i, l)
-                else:
-                    print(l)
+def title_year(title, year):
+    """Return title, with year if available."""
+    if year is not None:
+        return f"{title} ({year})"
+    else:
+        return title
 
-    def search(self, query, options):
-        """Perform a TV show or movie search."""
-        search = tmdb.Search()
-        searchf = search.tv if options.tv else search.movie
-        searchd = dict(query=query)
-        if options.language:
-            searchd['language'] = options.language
-        searchf(**searchd)
-        results = {}
-        for r in search.results:
-            y = None
-            if options.tv:
-                name = r['name']
-                try:
-                    y = r['first_air_date']
-                except KeyError:
-                    pass
+
+class Movie:
+    """A movie."""
+
+    def __init__(self, title, year, i):
+        self.title = title
+        self.year = year
+        self.i = i
+
+    def __str__(self):
+        return title_year(self.title, self.year)
+
+
+class Episode:
+    """A TV show episode."""
+
+    def __init__(self, season, episode, title):
+        self.season = season
+        self.episode = episode
+        self.title = title
+
+    def __str__(self):
+        return f"{self.season}x{self.episode:02d} {self.title}"
+
+
+class TVShow:
+    """A TV show with its episodes."""
+
+    def __init__(self, title=None, year=None, i=None):
+        self.title = title
+        self.year = year
+        self.i = i
+        self.episodes = []
+
+    def load(self, episodes_file):
+        """Load a TV show and its episodes from a file."""
+        title = episodes_file.readline().strip()
+        if not title:
+            raise RuntimeError("no TV show title in file")
+        year = None
+        m = re.fullmatch(r"(.*) \(([0-9]+)\)", title)
+        if m:
+            title = m.group(1)
+            year = int(m.group(2))
+        episodes = []
+        for line in episodes_file:
+            m = re.fullmatch(r"([0-9]+)x([0-9]+) (.*)", line.strip())
+            if not m:
+                raise RuntimeError("wrong episodes file format")
+            episodes.append(Episode(int(m.group(1)), int(m.group(2)), m.group(3)))
+        if not episodes:
+            raise RuntimeError("no episode in file")
+        self.title = title
+        self.year = year
+        self.episodes = episodes
+
+    def filter(self, seasons, episodes):
+        """Filter a list of episodes according to parameters."""
+        filtered = []
+        for e in self.episodes:
+            if seasons is not None and e.season not in seasons:
+                continue
+            if episodes is not None and (e.season, e.episode) not in episodes:
+                continue
+            filtered.append(e)
+        self.episodes = filtered
+
+    def __str__(self):
+        r = [title_year(self.title, self.year)]
+        for e in self.episodes:
+            r.append(str(e))
+        return "\n".join(r)
+
+
+def parse(args):
+    """Parse arguments and configuration."""
+    defaults = {}
+    # Parse configuration.
+    config = configparser.ConfigParser()
+    config.read([os.path.expanduser(CONFIG), os.path.expanduser(CONFIG)])
+    defaults.update(dict(config.items("DEFAULT")))
+    # Parse options.
+    p = argparse.ArgumentParser(description=__doc__)
+    p.set_defaults(**defaults)
+    p.add_argument("--api-key", help="API key created in your account")
+    p.add_argument("-l", "--language", help="content language")
+    p.add_argument(
+        "-t",
+        "--tv-show",
+        action="store_true",
+        help="query TV shows instead of movies",
+    )
+    p.add_argument(
+        "-s",
+        "--seasons",
+        nargs="+",
+        type=int,
+        metavar="S",
+        help="select TV show seasons",
+    )
+    p.add_argument(
+        "-a",
+        "--all-seasons",
+        action="store_true",
+        help="select all TV show seasons",
+    )
+    p.add_argument(
+        "-e",
+        "--episodes",
+        nargs="+",
+        metavar="SxE",
+        help="select TV show episodes, use SxE notation (e.g. 1x2 for the second"
+        " episode of the first season), or just the episode number if season is"
+        " selected with -s",
+    )
+    p.add_argument(
+        "-f",
+        "--file",
+        type=argparse.FileType("rt"),
+        help="load TV show episodes from given file instead of querying the"
+        " database (same format as this tool output)",
+    )
+    p.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="ask the user when not sure (else abort)",
+    )
+    p.add_argument(
+        "-r",
+        "--rename",
+        nargs="+",
+        metavar="FILE",
+        help="rename files given as parameter",
+    )
+    p.add_argument(
+        "-n", "--dry-run", action="store_true", help="only pretend, but do nothing"
+    )
+    p.add_argument("--suffix", help="suffix to add to each file being renamed")
+    p.add_argument("query", nargs="*", help="query terms")
+    options = p.parse_args()
+    # Check and return options.
+    if options.api_key is None and options.file is None:
+        p.error("need an API key")
+    if not options.query and options.file is None:
+        p.error("need a query or an episodes file")
+    if options.query and options.file is not None:
+        p.error("can not give both a query and an episodes file")
+    options.query = " ".join(options.query)
+    if options.episodes is not None:
+        episodes = []
+        for e in options.episodes:
+            m = re.fullmatch(r"([0-9]+)x([0-9]+)", e)
+            if m:
+                s, e = int(m.group(1)), int(m.group(2))
             else:
-                name = r['title']
                 try:
-                    y = r['release_date']
-                except KeyError:
-                    pass
-            l = []
-            l.append(name)
-            if y:
-                y, _, _ = y.split('-')
-                l.append('(%s)' % y)
-            results[r['id']] = ' '.join(l)
-        return results
+                    e = int(e)
+                except ValueError:
+                    raise RuntimeError("bad episode number format")
+                if options.seasons is None or len(options.seasons) != 1:
+                    raise RuntimeError(
+                        "need a single season, or full episode number (SxE format)"
+                    )
+                s = options.seasons[0]
+            episodes.append((s, e))
+        options.episodes = episodes
+    if (
+        options.file is not None
+        or options.seasons is not None
+        or options.all_seasons
+        or options.episodes is not None
+    ):
+        # Imply TV show if episodes are selected.
+        options.tv_show = True
+    elif options.rename and options.tv_show:
+        # When renaming TV shows, if no episodes selection, select all episodes.
+        options.all_seasons = True
+    return options
 
-    def select(self, results):
-        """Select one of the results."""
-        r = subprocess.run(['fzf', '--height=12', '--with-nth=2', '--delimiter=\t'],
-                           input='\n'.join(f'{i}\t{l}' for i, l in results.items()),
-                           stdout=subprocess.PIPE, text=True)
-        if r.returncode != 0:
+
+def search(query, options):
+    """Perform a TV show or movie search."""
+    tmdb.API_KEY = options.api_key
+    search = tmdb.Search()
+    searchf = search.tv if options.tv_show else search.movie
+    searchd = dict(query=query)
+    if options.language:
+        searchd["language"] = options.language
+    searchf(**searchd)
+    results = []
+    cls = TVShow if options.tv_show else Movie
+    for r in search.results:
+        y = None
+        if options.tv_show:
+            title = r["name"]
+            try:
+                y = r["first_air_date"]
+            except KeyError:
+                pass
+        else:
+            title = r["title"]
+            try:
+                y = r["release_date"]
+            except KeyError:
+                pass
+        if y:
+            y, _, _ = y.split("-")
+        i = r["id"]
+        results.append(cls(title, y, i))
+    return results
+
+
+def select(results, header=None):
+    """Select one of the results."""
+    if header:
+        header = [f"--header={header}"]
+        height = min(12, len(results) + 3)
+    else:
+        header = []
+        height = min(12, len(results) + 2)
+    r = subprocess.run(
+        ["fzf", f"--height={height}", "--with-nth=2", "--delimiter=\t"] + header,
+        input="\n".join(f"{i}\t{r}" for i, r in enumerate(results)),
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    if r.returncode != 0:
+        return None
+    else:
+        i = int(r.stdout.split(maxsplit=1)[0])
+        return results[i]
+
+
+def get_unique(query, options):
+    """Return a TV show or movie, ask the user if needed."""
+    results = search(query, options)
+    if len(results) == 0:
+        raise RuntimeError("no result")
+    elif len(results) == 1:
+        return results[0]
+    else:
+        r = select(results)
+        if r is None:
             raise RuntimeError("no selection done")
-        else:
-            return int(r.stdout.split(maxsplit=1)[0])
+        return r
 
-    def get_id(self, query, options):
-        """Return a TV or movie identifier and name, ask the user if needed."""
-        results = self.search(query, options)
-        if len(results) == 0:
-            raise RuntimeError("no result")
-        elif len(results) == 1:
-            for i, l in results.items():
-                return i, l
-        else:
-            i = self.select(results)
-            return i, results[i]
 
-    def get_seasons(self, tv_id, options):
-        """Get the list of seasons for a TV show."""
-        if options.season is not None:
-            return [options.season]
-        else:
-            tv = tmdb.TV(tv_id)
-            infod = dict()
-            if options.language:
-                infod['language'] = options.language
-            tv.info(**infod)
-            return [s['season_number'] for s in tv.seasons]
+def get_seasons(tv_show, options):
+    """Get list of seasons for a TV show."""
+    if options.episodes is not None:
+        seasons = set()
+        for s, e in options.episodes:
+            seasons.add(s)
+        return list(seasons)
+    elif options.seasons is not None:
+        return options.seasons
+    else:
+        tv = tmdb.TV(tv_show.i)
+        infod = dict()
+        if options.language:
+            infod["language"] = options.language
+        tv.info(**infod)
+        return [s["season_number"] for s in tv.seasons]
 
-    def show_season(self, tv_id, options):
-        """Print the list of episodes for a TV show season."""
-        for s in self.get_seasons(tv_id, options):
-            season = tmdb.TV_Seasons(tv_id, s)
-            infod = dict()
-            if options.language:
-                infod['language'] = options.language
+
+def add_episodes(tv_show, options):
+    """Populate a TV show with its episodes."""
+    for s in get_seasons(tv_show, options):
+        season = tmdb.TV_Seasons(tv_show.i, s)
+        infod = dict()
+        if options.language:
+            infod["language"] = options.language
+        try:
             season.info(**infod)
-            for e in season.episodes:
-                print('%dx%02d %s' % (season.season_number, e['episode_number'],
-                    e['name']))
+        except requests.exceptions.HTTPError:
+            raise RuntimeError("season %d does not exists" % s)
+        for e in season.episodes:
+            tv_show.episodes.append(Episode(s, e["episode_number"], e["name"]))
+    tv_show.filter(options.seasons, options.episodes)
 
-if __name__ == '__main__':
+
+def rename_episode(f, tv_show, episode, options):
+    """Rename a single episode file."""
+    directory = title_year(tv_show.title, tv_show.year)
+    _, ext = os.path.splitext(f)
+    suffix = f" - {options.suffix}" if options.suffix else ""
+    name = f"{tv_show.title} {episode}{suffix}{ext}"
+    newf = os.path.join(directory, name)
+    print(f"rename {repr(f)} to {repr(newf)}")
+    if not options.dry_run:
+        os.renames(f, newf)
+
+
+def rename_tv_shows(results, options):
+    """Rename TV shows files."""
+    assert len(results) == 1
+    tv_show = results[0]
+    if options.interactive:
+        for f in options.rename:
+            e = select(tv_show.episodes, f"select episode for {repr(f)}")
+            if e is None:
+                print(f"skipped {f}")
+            else:
+                rename_episode(f, tv_show, e, options)
+    else:
+        if len(tv_show.episodes) != len(options.rename):
+            raise RuntimeError("number of files and number of episodes do not match")
+        for f, e in zip(options.rename, tv_show.episodes):
+            rename_episode(f, tv_show, e, options)
+
+
+def rename_movie(f, movie, options):
+    """Rename a movie file."""
+    _, ext = os.path.splitext(f)
+    suffix = f" - {options.suffix}" if options.suffix else ""
+    newf = f"{movie}{suffix}{ext}"
+    print(f"rename {repr(f)} to {repr(newf)}")
+    if not options.dry_run:
+        os.renames(f, newf)
+
+
+def rename_movies(results, options):
+    """Rename movies files."""
+    if options.interactive or len(options.rename) != 1 or len(results) != 1:
+        for f in options.rename:
+            movie = select(results, f"select movie for {repr(f)}")
+            if movie is None:
+                print(f"skipped {f}")
+            else:
+                rename_movie(f, movie, options)
+    else:
+        rename_movie(options.rename[0], results[0], options)
+
+
+def run(options):
+    """Run requested action."""
+    # Find movies, TV shows or episodes.
+    if options.file is not None:
+        r = TVShow()
+        r.load(options.file)
+        r.filter(options.seasons, options.episodes)
+        results = [r]
+    elif (
+        options.seasons is not None
+        or options.all_seasons
+        or options.episodes is not None
+    ):
+        r = get_unique(options.query, options)
+        add_episodes(r, options)
+        results = [r]
+    else:
+        results = search(options.query, options)
+    # Action: print or rename.
+    if not options.rename:
+        for r in results:
+            print(r)
+    elif options.tv_show:
+        rename_tv_shows(results, options)
+    else:
+        rename_movies(results, options)
+
+
+if __name__ == "__main__":
     import sys
-    a = App()
+
     try:
-        a.run(sys.argv[1:])
+        options = parse(sys.argv[1:])
+        run(options)
     except RuntimeError as e:
+        sys.exit(str(e))
+    except OSError as e:
         sys.exit(str(e))
