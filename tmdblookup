@@ -120,7 +120,7 @@ def parse(args):
     defaults = {}
     # Parse configuration.
     config = configparser.ConfigParser()
-    config.read([os.path.expanduser(CONFIG), os.path.expanduser(CONFIG)])
+    config.read([os.path.expanduser(CONFIG)])
     defaults.update(dict(config.items("DEFAULT")))
     # Parse options.
     p = argparse.ArgumentParser(description=__doc__)
