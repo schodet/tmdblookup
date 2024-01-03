@@ -347,8 +347,12 @@ def rename_tv_shows(results, options):
             else:
                 rename_episode(f, tv_show, e, options)
     else:
-        if len(tv_show.episodes) != len(options.rename):
-            raise RuntimeError("number of files and number of episodes do not match")
+        n_files = len(options.rename)
+        n_episodes = len(tv_show.episodes)
+        if n_episodes != n_files:
+            raise RuntimeError(
+                f"number of files ({n_files}) and number of episodes ({n_episodes}) do not match"
+            )
         for f, e in zip(options.rename, tv_show.episodes):
             rename_episode(f, tv_show, e, options)
 
