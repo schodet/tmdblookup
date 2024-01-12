@@ -180,6 +180,7 @@ def parse(args):
         "-n", "--dry-run", action="store_true", help="only pretend, but do nothing"
     )
     p.add_argument("--suffix", help="suffix to add to each file being renamed")
+    p.add_argument("--year", help="query year")
     p.add_argument("query", nargs="*", help="query terms")
     options = p.parse_args()
     # Check and return options.
@@ -187,9 +188,14 @@ def parse(args):
         p.error("need an API key")
     if not options.query and options.file is None:
         p.error("need a query or an episodes file")
-    if options.query and options.file is not None:
+    if (options.query or options.year is not None) and options.file is not None:
         p.error("can not give both a query and an episodes file")
     options.query = " ".join(options.query)
+    if options.year is None:
+        m = re.fullmatch(r"(.*) \(([0-9]+)\)", options.query)
+        if m:
+            options.query = m.group(1)
+            options.year = m.group(2)
     if options.episodes is not None:
         episodes = []
         for e in options.episodes:
@@ -226,31 +232,40 @@ def search(query, options):
     """Perform a TV show or movie search."""
     tmdb.API_KEY = options.api_key
     search = tmdb.Search()
-    searchf = search.tv if options.tv_show else search.movie
     searchd = dict(query=query)
     if options.language:
         searchd["language"] = options.language
-    searchf(**searchd)
     results = []
-    cls = TVShow if options.tv_show else Movie
-    for r in search.results:
-        y = None
-        if options.tv_show:
-            title = r["name"]
-            try:
-                y = r["first_air_date"]
-            except KeyError:
-                pass
-        else:
+    if not options.tv_show:
+        if options.year is not None:
+            searchd["year"] = options.year
+        search.movie(**searchd)
+        for r in search.results:
+            y = None
             title = r["title"]
             try:
                 y = r["release_date"]
             except KeyError:
                 pass
-        if y:
-            y, _, _ = y.split("-")
-        i = r["id"]
-        results.append(cls(title, y, i))
+            if y:
+                y, _, _ = y.split("-")
+            i = r["id"]
+            results.append(Movie(title, y, i))
+    else:
+        if options.year is not None:
+            searchd["first_air_date_year"] = options.year
+        search.tv(**searchd)
+        for r in search.results:
+            y = None
+            title = r["name"]
+            try:
+                y = r["first_air_date"]
+            except KeyError:
+                pass
+            if y:
+                y, _, _ = y.split("-")
+            i = r["id"]
+            results.append(TVShow(title, y, i))
     return results
 
 
